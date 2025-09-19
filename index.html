@@ -10,7 +10,6 @@
     (function ensureBaseHref() {
       try {
         const current = new URL(document.currentScript?.src || window.location.href, window.location.href);
-        const base = new URL('./', current.href);
         const baseEl = document.createElement('base');
         baseEl.href = base.href;
         document.head.appendChild(baseEl);
@@ -26,10 +25,9 @@
   <header class="topbar">
     <div class="header-logos">
       <img src="data/aguaseguralogo1.png" alt="Água Segura" class="logo-small" />
-      <img src="data/logo_sanepar.jpg" alt="Sanepar" class="logo-small" />
-      <img src="data/Logo_IAT_PR.png" alt="IAT" class="logo-small" />
-      <img src="data/adapar (2).png" alt="IDR-SEAB" class="logo-small" />
+      <img src="data/aguaseguralogo2.png" alt="Água Segura alternativa" class="logo-small" />
       <img src="data/logo_IDR-SEAB.png" alt="IDR-SEAB" class="logo-small" />
+      <img src="data/logo_sanepar.jpg" alt="Sanepar" class="logo-small" />
     </div>
     <button id="fitAll" class="btn" type="button">Ajustar visão</button>
     <div class="slider-row">
@@ -37,7 +35,7 @@
       <input id="opacity" type="range" min="20" max="100" value="70" />
       <span id="opacityVal" class="muted">70%</span>
     </div>
-    <span class="version">v4.0 — IDR-Paraná © 2025 </span>
+    <span class="version">v4.1 — filtros por região e legendas recalculadas</span>
   </header>
 
   <div id="map"></div>
@@ -48,6 +46,7 @@
   <script src="script.js" defer></script>
 </body>
 </html>
+
 
 
 
