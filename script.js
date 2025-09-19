@@ -30,7 +30,7 @@
       const digits = abs >= 100 ? 0 : abs >= 10 ? 1 : 2;
       return value.toLocaleString('pt-BR', {
         minimumFractionDigits: digits,
-        maximumFractionDigits: digits
+             maximumFractionDigits: digits
       });
     },
     km(value) {
@@ -55,9 +55,21 @@
     }
   };
 
-  const CODE_FIELD_CANDIDATES = ['Cod_man', 'COD_MAN', 'cod_man', 'codman'];
+  const CODE_FIELD_CANDIDATES = [
+    'Cod_otto',
+    'COD_OTTO',
+    'cod_otto',
+    'codotto',
+    'Cod_man',
+    'COD_MAN',
+    'cod_man',
+    'codman'
+  ];
   const MICRO_NAME_FIELDS = ['Nome_bacia', 'NOME_BACIA', 'nome_bacia'];
-  const MICRO_MANANCIAL_FIELDS = ['Manancial', 'MANANCIAL'];
+  const MICRO_MANANCIAL_FIELDS = ['Página1_M', 'Pagina1_M', 'Manancial', 'MANANCIAL'];
+  const MICRO_MANANCIAL_CODE_FIELDS = ['Cod_man', 'COD_MAN', 'cod_man', 'codman'];
+  const MICRO_REGION_FIELDS = ['Regiao', 'REGIAO', 'Região', 'REGIÃO', 'Página1_R', 'Pagina1_R'];
+  const MICRO_MUNICIPIO_FIELDS = ['Municipio', 'MUNICIPIO', 'Município', 'MUNICÍPIO', 'Página1_N', 'Pagina1_N'];
   const MICRO_CLASS_FIELDS = ['Classe', 'CLASSE'];
   const DECLIVIDADE_FIELDS = ['ClDec', 'CLDEC', 'cldec'];
   const ALTIMETRIA_FIELDS = ['ClAlt', 'CLALT', 'clalt'];
@@ -230,40 +242,74 @@
       }
       return parseGeoJson(text);
     }
-    const text = await response.text();
-    return parseGeoJson(text);
+  const EARTH_RADIUS = 6378137;
+
+  function toRadians(value) {
+    return (value * Math.PI) / 180;
   }
 
-  function parseGeoJson(payload) {
-    if (!payload) return [];
-    let data = payload;
-    if (typeof payload === 'string') {
-      try {
-        data = JSON.parse(payload);
-      } catch (error) {
-        console.warn('JSON inválido detectado durante o carregamento.', error);
-        return [];
+  function ringArea(coordinates) {
+    if (!Array.isArray(coordinates) || coordinates.length < 4) return 0;
+    let total = 0;
+    for (let i = 0; i < coordinates.length - 1; i += 1) {
+      const [lon1, lat1] = coordinates[i];
+      const [lon2, lat2] = coordinates[i + 1];
+      if (!Number.isFinite(lon1) || !Number.isFinite(lat1) || !Number.isFinite(lon2) || !Number.isFinite(lat2)) {
+        continue;
       }
+      const lon1Rad = toRadians(lon1);
+      const lon2Rad = toRadians(lon2);
+      const lat1Rad = toRadians(lat1);
+      const lat2Rad = toRadians(lat2);
+      total += (lon2Rad - lon1Rad) * (2 + Math.sin(lat1Rad) + Math.sin(lat2Rad));
     }
-    if (!data) return [];
-    if (data.type === 'FeatureCollection' && Array.isArray(data.features)) {
-      return data.features.filter(Boolean);
+    return (total * EARTH_RADIUS * EARTH_RADIUS) / 2;
+  }
+
+  function polygonArea(coordinates) {
+    if (!Array.isArray(coordinates) || coordinates.length === 0) return 0;
+    let area = Math.abs(ringArea(coordinates[0]));
+    for (let i = 1; i < coordinates.length; i += 1) {
+      area -= Math.abs(ringArea(coordinates[i]));
     }
-    if (data.type === 'Feature') {
-      return [data];
+    return area;
+  }
+
+  function multiPolygonArea(coordinates) {
+    if (!Array.isArray(coordinates) || coordinates.length === 0) return 0;
+    return coordinates.reduce((sum, polygon) => sum + polygonArea(polygon), 0);
+  }
+
+  function geometryArea(geometry) {
+    if (!geometry) return 0;
+    switch (geometry.type) {
+      case 'Polygon':
+        return polygonArea(geometry.coordinates);
+      case 'MultiPolygon':
+        return multiPolygonArea(geometry.coordinates);
+      case 'GeometryCollection':
+        return (geometry.geometries || []).reduce((sum, geom) => sum + geometryArea(geom), 0);
+      default:
+        return 0;
     }
-    return [];
   }
 
   function computeAreaHa(feature) {
-    if (!feature || !turf) return 0;
-    try {
-      const area = turf.area(feature);
-      return Number.isFinite(area) ? area / 10000 : 0;
-    } catch (error) {
-      console.warn('Falha ao calcular área de uma feição.', error);
-      return 0;
+    if (!feature) return 0;
+    let area = 0;
+    if (turf && typeof turf.area === 'function') {
+      try {
+        area = turf.area(feature);
+      } catch (error) {
+        console.warn('Falha ao calcular área de uma feição com Turf.', error);
+        area = 0;
+      }
     }
+    if (!Number.isFinite(area) || area <= 0) {
+      const geometry = feature.geometry || feature;
+      area = geometryArea(geometry);
+    }
+    return Number.isFinite(area) && area > 0 ? area / 10000 : 0;
   }
 
   function computeLengthKm(feature) {
@@ -997,7 +1043,6 @@
           console.error(`Falha ao carregar ${file}`, error);
         }
       }
-      state.features = collected;
       const sampleProps = collected.find(item => item && item.properties)?.properties || null;
       const codeField = sampleProps ? findField(sampleProps, CODE_FIELD_CANDIDATES) : null;
       state.codeField = codeField;
@@ -1021,13 +1066,23 @@
       const props = feature?.properties || {};
       const nome = trim(getFirstValue(props, MICRO_NAME_FIELDS));
       const manancial = trim(getFirstValue(props, MICRO_MANANCIAL_FIELDS));
+      const manancialAlt = trim(getFirstValue(props, ['Manancial', 'MANANCIAL']));
+      const manancialCode = trim(getFirstValue(props, MICRO_MANANCIAL_CODE_FIELDS));
+      const region = trim(getFirstValue(props, MICRO_REGION_FIELDS));
+      const municipio = trim(getFirstValue(props, MICRO_MUNICIPIO_FIELDS));
       const classe = trim(getFirstValue(props, MICRO_CLASS_FIELDS));
-      const subtitle = [manancial, classe].filter(Boolean).join(' • ');
+      const locationInfo = [municipio, region].filter(Boolean).join(' / ');
+      const subtitle = [manancial || manancialAlt, locationInfo, classe].filter(Boolean).join(' • ');
+      const searchPieces = [code, manancialCode, nome, manancial, manancialAlt, classe, region, municipio].filter(Boolean);
       mapByCode.set(code, {
         code,
         title: nome || `Microbacia ${code}`,
         subtitle,
-        search: normaliseText(`${code} ${nome} ${manancial} ${classe}`)
+        region,
+        municipio,
+        manancial: manancial || manancialAlt,
+        classe,
+        search: normaliseText(searchPieces.join(' '))
       });
     });
     microOptions = Array.from(mapByCode.values()).sort((a, b) => a.title.localeCompare(b.title, 'pt-BR'));
@@ -1035,6 +1090,10 @@
     microOptions.forEach(option => allMicroCodes.add(option.code));
     activeCodes = new Set(allMicroCodes);
     microOptionsReady = true;
+    selectedRegion = '';
+    selectedMunicipio = '';
+    selectedManancial = '';
+    lastRenderedCodes = [];
     refreshMicroUi();
   }
 
