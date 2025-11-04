@@ -270,7 +270,13 @@
       if (!lowerKey.includes('area')) continue;
       const value = parseNumeric(raw);
       if (!Number.isFinite(value) || value <= 0) continue;
-      if (lowerKey.includes('m2') || lowerKey.includes('metros') || lowerKey.includes('m²')) {
+      if (
+        lowerKey.includes('m2') ||
+        lowerKey.includes('metros') ||
+        lowerKey.includes('metro') ||
+        lowerKey.includes('meters') ||
+        lowerKey.includes('m²')
+      ) {
         return value / 10000;
       }
       if (lowerKey.includes('ha') || lowerKey.includes('hect')) {
@@ -474,8 +480,56 @@
     return (value * Math.PI) / 180;
   }
 
-  function ringArea(coordinates) {
+  function detectCoordinateSpace(geometry) {
+    if (!geometry) return 'geographic';
+    const stack = [];
+    if (Array.isArray(geometry)) {
+      stack.push(geometry);
+    } else if (geometry.type === 'GeometryCollection') {
+      (geometry.geometries || []).forEach(geom => stack.push(geom));
+    } else if (geometry && geometry.coordinates) {
+      stack.push(geometry.coordinates);
+    }
+    while (stack.length) {
+      const current = stack.pop();
+      if (!current) continue;
+      if (Array.isArray(current)) {
+        if (current.length >= 2 && typeof current[0] === 'number' && typeof current[1] === 'number') {
+          const x = current[0];
+          const y = current[1];
+          if (Number.isFinite(x) && Number.isFinite(y) && (Math.abs(x) > 180 || Math.abs(y) > 90)) {
+            return 'projected';
+          }
+          continue;
+        }
+        for (let i = 0; i < current.length; i += 1) {
+          stack.push(current[i]);
+        }
+      } else if (current && typeof current === 'object') {
+        if (current.type === 'GeometryCollection') {
+          (current.geometries || []).forEach(geom => stack.push(geom));
+        } else if (current.coordinates) {
+          stack.push(current.coordinates);
+        }
+      }
+    }
+    return 'geographic';
+  }
+
+  function ringArea(coordinates, space) {
     if (!Array.isArray(coordinates) || coordinates.length < 4) return 0;
+    if (space === 'projected') {
+      let total = 0;
+      for (let i = 0; i < coordinates.length - 1; i += 1) {
+        const [x1, y1] = coordinates[i];
+        const [x2, y2] = coordinates[i + 1];
+        if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(x2) || !Number.isFinite(y2)) {
+          continue;
+        }
+        total += x1 * y2 - x2 * y1;
+      }
+      return Math.abs(total) / 2;
+    }
     let total = 0;
     for (let i = 0; i < coordinates.length - 1; i += 1) {
       const [lon1, lat1] = coordinates[i];
@@ -489,32 +543,37 @@
       const lat2Rad = toRadians(lat2);
       total += (lon2Rad - lon1Rad) * (2 + Math.sin(lat1Rad) + Math.sin(lat2Rad));
     }
-    return (total * EARTH_RADIUS * EARTH_RADIUS) / 2;
+    return Math.abs((total * EARTH_RADIUS * EARTH_RADIUS) / 2);
   }
 
-  function polygonArea(coordinates) {
+  function polygonArea(coordinates, space) {
     if (!Array.isArray(coordinates) || coordinates.length === 0) return 0;
-    let area = Math.abs(ringArea(coordinates[0]));
+    const outer = ringArea(coordinates[0], space);
+    let area = outer;
     for (let i = 1; i < coordinates.length; i += 1) {
-      area -= Math.abs(ringArea(coordinates[i]));
+      area -= ringArea(coordinates[i], space);
     }
-    return area;
+    return Math.max(0, area);
   }
 
-  function multiPolygonArea(coordinates) {
+  function multiPolygonArea(coordinates, space) {
     if (!Array.isArray(coordinates) || coordinates.length === 0) return 0;
-    return coordinates.reduce((sum, polygon) => sum + polygonArea(polygon), 0);
+    return coordinates.reduce((sum, polygon) => sum + polygonArea(polygon, space), 0);
   }
 
-  function geometryArea(geometry) {
+  function geometryArea(geometry, space) {
     if (!geometry) return 0;
+    if (geometry.type === 'Feature') {
+      return geometryArea(geometry.geometry, space);
+    }
+    const coordSpace = space || detectCoordinateSpace(geometry);
     switch (geometry.type) {
       case 'Polygon':
-        return polygonArea(geometry.coordinates);
+        return polygonArea(geometry.coordinates, coordSpace);
       case 'MultiPolygon':
-        return multiPolygonArea(geometry.coordinates);
+        return multiPolygonArea(geometry.coordinates, coordSpace);
       case 'GeometryCollection':
-        return (geometry.geometries || []).reduce((sum, geom) => sum + geometryArea(geom), 0);
+        return (geometry.geometries || []).reduce((sum, geom) => sum + geometryArea(geom, coordSpace), 0);
       default:
         return 0;
     }
@@ -522,8 +581,11 @@
 
   function computeAreaHa(feature) {
     if (!feature) return 0;
+    const geometry = feature.geometry || feature;
+    if (!geometry) return 0;
+    const space = detectCoordinateSpace(geometry);
     let area = 0;
-    if (turf && typeof turf.area === 'function') {
+    if (space === 'geographic' && turf && typeof turf.area === 'function') {
       try {
         area = turf.area(feature);
       } catch (error) {
@@ -532,8 +594,7 @@
       }
     }
     if (!Number.isFinite(area) || area <= 0) {
-      const geometry = feature.geometry || feature;
-      area = geometryArea(geometry);
+      area = geometryArea(geometry, space);
     }
     return Number.isFinite(area) && area > 0 ? area / 10000 : 0;
   }
@@ -690,7 +751,10 @@
       });
     }
     rawCodes.forEach(code => {
-      if (code) {
+      const normalised = normaliseCode(code);
+      if (normalised) {
+        codes.add(normalised);
+      } else if (code) {
         codes.add(code);
       }
     });
@@ -799,6 +863,41 @@
       if (selectedCodes.has(codes)) return true;
     }
     return !!code && selectedCodes.has(code);
+  }
+
+  function gatherItemCodes(item, target) {
+    if (!item || !target) return;
+    const addValue = value => {
+      if (!value) return;
+      const normalised = normaliseCode(value);
+      target.add(normalised || value);
+    };
+    const { codes, code } = item;
+    if (codes instanceof Set) {
+      codes.forEach(addValue);
+    } else if (Array.isArray(codes)) {
+      codes.forEach(addValue);
+    } else if (typeof codes === 'string' && codes) {
+      addValue(codes);
+    }
+    if (code) {
+      addValue(code);
+    }
+  }
+
+  function collectMissingCodes(state, selectedCodes) {
+    if (!state || !(selectedCodes instanceof Set) || selectedCodes.size === 0) {
+      return [];
+    }
+    const present = new Set();
+    (state.filtered || []).forEach(item => gatherItemCodes(item, present));
+    const missing = [];
+    selectedCodes.forEach(code => {
+      if (!present.has(code)) {
+        missing.push(code);
+      }
+    });
+    return missing.sort((a, b) => String(a).localeCompare(String(b), 'pt-BR'));
   }
 
   function createPopupContent(feature) {
@@ -1576,12 +1675,16 @@
     if (!legendContainer) return;
     legendContainer.innerHTML = '';
 
+    const selectionCodes = effectiveCodes === null
+      ? (activeCodes instanceof Set && activeCodes.size ? activeCodes : null)
+      : effectiveCodes;
+
     const activeStates = [];
     stateByKey.forEach(state => {
       if (!state || !state.ready) return;
       if (!map.hasLayer(state.group)) return;
-      if (!state.filtered || !state.filtered.length) return;
-      activeStates.push(state);
+      if (!state.filtered) return;
+      activeStates.push({ state, hasData: state.filtered.length > 0 });
     });
 
     if (!activeStates.length) {
@@ -1606,7 +1709,7 @@
       legendContainer.appendChild(summary);
     }
 
-    activeStates.forEach(state => {
+    activeStates.forEach(({ state, hasData }) => {
       const block = document.createElement('div');
       block.className = 'legend-block';
       const header = document.createElement('h4');
@@ -1616,14 +1719,32 @@
       const legend = state.def.legend || {};
       const type = legend.type || 'area-total';
 
-      if (type === 'area-classes') {
-        block.appendChild(renderAreaClassesLegend(state, legend, effectiveCodes));
-      } else if (type === 'length-total') {
-        block.appendChild(renderLengthLegend(state, legend));
-      } else if (type === 'count-total') {
-        block.appendChild(renderCountLegend(state, legend));
+      if (hasData) {
+        if (type === 'area-classes') {
+          block.appendChild(renderAreaClassesLegend(state, legend, effectiveCodes));
+        } else if (type === 'length-total') {
+          block.appendChild(renderLengthLegend(state, legend));
+        } else if (type === 'count-total') {
+          block.appendChild(renderCountLegend(state, legend));
+        } else {
+          block.appendChild(renderAreaTotalLegend(state, legend, effectiveCodes));
+        }
       } else {
-        block.appendChild(renderAreaTotalLegend(state, legend, effectiveCodes));
+        const note = document.createElement('div');
+        note.className = 'legend-note';
+        let message = 'Nenhuma feição atende à seleção atual.';
+        if (selectionCodes instanceof Set && selectionCodes.size) {
+          const missing = collectMissingCodes(state, selectionCodes);
+          if (missing.length) {
+            const preview = missing.slice(0, 4).map(code => `OTTO ${code}`).join(', ');
+            const remaining = missing.length - Math.min(missing.length, 4);
+            message = remaining > 0
+              ? `Sem registros para ${preview} e mais ${remaining} microbacia(s).`
+              : `Sem registros para ${preview}.`;
+          }
+        }
+        note.textContent = message;
+        block.appendChild(note);
       }
 
       if (legend.note) {
@@ -1631,6 +1752,20 @@
         note.className = 'legend-note';
         note.textContent = legend.note;
         block.appendChild(note);
+      }
+
+      if (hasData && selectionCodes instanceof Set && selectionCodes.size) {
+        const missing = collectMissingCodes(state, selectionCodes);
+        if (missing.length) {
+          const note = document.createElement('div');
+          note.className = 'legend-note';
+          const preview = missing.slice(0, 4).map(code => `OTTO ${code}`).join(', ');
+          const remaining = missing.length - Math.min(missing.length, 4);
+          note.textContent = remaining > 0
+            ? `Sem registros para ${preview} e mais ${remaining} microbacia(s).`
+            : `Sem registros para ${preview}.`;
+          block.appendChild(note);
+        }
       }
 
       legendContainer.appendChild(block);
