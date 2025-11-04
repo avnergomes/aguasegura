@@ -173,13 +173,32 @@
   const microIndex = {
     byCode: new Map(),
     manancialCodeToOtto: new Map(),
-    manancialNameToOtto: new Map()
+    manancialNameToOtto: new Map(),
+    fullBounds: null
   };
   let microIndexReady = false;
 
   function trim(value) {
     if (value === undefined || value === null) return '';
     return String(value).trim();
+  }
+
+  function normaliseCode(value) {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return '';
+      return Math.trunc(value).toString();
+    }
+    const text = trim(value);
+    if (!text) return '';
+    if (/^\d+(?:\.\d+)?$/.test(text)) {
+      const parsed = Number(text);
+      if (Number.isFinite(parsed)) {
+        return Math.trunc(parsed).toString();
+      }
+    }
+    const digits = text.replace(/\D+/g, '');
+    return digits || text;
   }
 
   function normaliseText(value) {
@@ -216,6 +235,58 @@
     }
     const parsed = Number(normalised);
     return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+
+  function extractFeatureArea(props) {
+    if (!props) return Number.NaN;
+    const entries = Object.keys(props);
+    if (!entries.length) return Number.NaN;
+    const lower = Object.create(null);
+    entries.forEach(key => {
+      lower[key.toLowerCase()] = key;
+    });
+    const haCandidates = [
+      'area_ha',
+      'area_hectares',
+      'area_ha_calc',
+      'area_ha_1',
+      'area_ha_2',
+      'area_total_ha',
+      'areaha',
+      'area_ha_mapa'
+    ];
+    for (const candidate of haCandidates) {
+      const key = lower[candidate];
+      if (!key) continue;
+      const value = parseNumeric(props[key]);
+      if (Number.isFinite(value) && value > 0) {
+        return value;
+      }
+    }
+    for (const key of entries) {
+      const raw = props[key];
+      if (raw === undefined || raw === null || raw === '') continue;
+      const lowerKey = key.toLowerCase();
+      if (!lowerKey.includes('area')) continue;
+      const value = parseNumeric(raw);
+      if (!Number.isFinite(value) || value <= 0) continue;
+      if (
+        lowerKey.includes('m2') ||
+        lowerKey.includes('metros') ||
+        lowerKey.includes('metro') ||
+        lowerKey.includes('meters') ||
+        lowerKey.includes('m²')
+      ) {
+        return value / 10000;
+      }
+      if (lowerKey.includes('ha') || lowerKey.includes('hect')) {
+        return value;
+      }
+      if (lowerKey.endsWith('_area') || lowerKey.endsWith('area')) {
+        return value;
+      }
+    }
+    return Number.NaN;
   }
 
   function ensureSet(map, key) {
@@ -409,8 +480,56 @@
     return (value * Math.PI) / 180;
   }
 
-  function ringArea(coordinates) {
+  function detectCoordinateSpace(geometry) {
+    if (!geometry) return 'geographic';
+    const stack = [];
+    if (Array.isArray(geometry)) {
+      stack.push(geometry);
+    } else if (geometry.type === 'GeometryCollection') {
+      (geometry.geometries || []).forEach(geom => stack.push(geom));
+    } else if (geometry && geometry.coordinates) {
+      stack.push(geometry.coordinates);
+    }
+    while (stack.length) {
+      const current = stack.pop();
+      if (!current) continue;
+      if (Array.isArray(current)) {
+        if (current.length >= 2 && typeof current[0] === 'number' && typeof current[1] === 'number') {
+          const x = current[0];
+          const y = current[1];
+          if (Number.isFinite(x) && Number.isFinite(y) && (Math.abs(x) > 180 || Math.abs(y) > 90)) {
+            return 'projected';
+          }
+          continue;
+        }
+        for (let i = 0; i < current.length; i += 1) {
+          stack.push(current[i]);
+        }
+      } else if (current && typeof current === 'object') {
+        if (current.type === 'GeometryCollection') {
+          (current.geometries || []).forEach(geom => stack.push(geom));
+        } else if (current.coordinates) {
+          stack.push(current.coordinates);
+        }
+      }
+    }
+    return 'geographic';
+  }
+
+  function ringArea(coordinates, space) {
     if (!Array.isArray(coordinates) || coordinates.length < 4) return 0;
+    if (space === 'projected') {
+      let total = 0;
+      for (let i = 0; i < coordinates.length - 1; i += 1) {
+        const [x1, y1] = coordinates[i];
+        const [x2, y2] = coordinates[i + 1];
+        if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(x2) || !Number.isFinite(y2)) {
+          continue;
+        }
+        total += x1 * y2 - x2 * y1;
+      }
+      return Math.abs(total) / 2;
+    }
     let total = 0;
     for (let i = 0; i < coordinates.length - 1; i += 1) {
       const [lon1, lat1] = coordinates[i];
@@ -424,32 +543,37 @@
       const lat2Rad = toRadians(lat2);
       total += (lon2Rad - lon1Rad) * (2 + Math.sin(lat1Rad) + Math.sin(lat2Rad));
     }
-    return (total * EARTH_RADIUS * EARTH_RADIUS) / 2;
+    return Math.abs((total * EARTH_RADIUS * EARTH_RADIUS) / 2);
   }
 
-  function polygonArea(coordinates) {
+  function polygonArea(coordinates, space) {
     if (!Array.isArray(coordinates) || coordinates.length === 0) return 0;
-    let area = Math.abs(ringArea(coordinates[0]));
+    const outer = ringArea(coordinates[0], space);
+    let area = outer;
     for (let i = 1; i < coordinates.length; i += 1) {
-      area -= Math.abs(ringArea(coordinates[i]));
+      area -= ringArea(coordinates[i], space);
     }
-    return area;
+    return Math.max(0, area);
   }
 
-  function multiPolygonArea(coordinates) {
+  function multiPolygonArea(coordinates, space) {
     if (!Array.isArray(coordinates) || coordinates.length === 0) return 0;
-    return coordinates.reduce((sum, polygon) => sum + polygonArea(polygon), 0);
+    return coordinates.reduce((sum, polygon) => sum + polygonArea(polygon, space), 0);
   }
 
-  function geometryArea(geometry) {
+  function geometryArea(geometry, space) {
     if (!geometry) return 0;
+    if (geometry.type === 'Feature') {
+      return geometryArea(geometry.geometry, space);
+    }
+    const coordSpace = space || detectCoordinateSpace(geometry);
     switch (geometry.type) {
       case 'Polygon':
-        return polygonArea(geometry.coordinates);
+        return polygonArea(geometry.coordinates, coordSpace);
       case 'MultiPolygon':
-        return multiPolygonArea(geometry.coordinates);
+        return multiPolygonArea(geometry.coordinates, coordSpace);
       case 'GeometryCollection':
-        return (geometry.geometries || []).reduce((sum, geom) => sum + geometryArea(geom), 0);
+        return (geometry.geometries || []).reduce((sum, geom) => sum + geometryArea(geom, coordSpace), 0);
       default:
         return 0;
     }
@@ -457,8 +581,11 @@
 
   function computeAreaHa(feature) {
     if (!feature) return 0;
+    const geometry = feature.geometry || feature;
+    if (!geometry) return 0;
+    const space = detectCoordinateSpace(geometry);
     let area = 0;
-    if (turf && typeof turf.area === 'function') {
+    if (space === 'geographic' && turf && typeof turf.area === 'function') {
       try {
         area = turf.area(feature);
       } catch (error) {
@@ -467,8 +594,7 @@
       }
     }
     if (!Number.isFinite(area) || area <= 0) {
-      const geometry = feature.geometry || feature;
-      area = geometryArea(geometry);
+      area = geometryArea(geometry, space);
     }
     return Number.isFinite(area) && area > 0 ? area / 10000 : 0;
   }
@@ -576,6 +702,37 @@
     return meta;
   }
 
+  function mergeUnique(target, source) {
+    if (!Array.isArray(target) || !Array.isArray(source)) return;
+    source.forEach(value => {
+      if (!value) return;
+      if (!target.includes(value)) {
+        target.push(value);
+      }
+    });
+  }
+
+  function buildLayerCodeMetadata(def, features) {
+    const meta = {
+      codeFields: def?.codeFields ? [...def.codeFields] : [],
+      manancialFields: def?.manancialFields ? [...def.manancialFields] : [],
+      manancialNameFields: def?.manancialNameFields ? [...def.manancialNameFields] : []
+    };
+    if (!Array.isArray(features) || !features.length) {
+      return meta;
+    }
+    const limit = Math.min(features.length, 200);
+    for (let i = 0; i < limit; i += 1) {
+      const props = features[i]?.properties;
+      if (!props) continue;
+      const detected = detectCodeMetadata(props, def);
+      mergeUnique(meta.codeFields, detected.codeFields);
+      mergeUnique(meta.manancialFields, detected.manancialFields);
+      mergeUnique(meta.manancialNameFields, detected.manancialNameFields);
+    }
+    return meta;
+  }
+
   function resolveFeatureCodes(props, meta = {}) {
     const codes = new Set();
     if (!props) {
@@ -594,7 +751,10 @@
       });
     }
     rawCodes.forEach(code => {
-      if (code) {
+      const normalised = normaliseCode(code);
+      if (normalised) {
+        codes.add(normalised);
+      } else if (code) {
         codes.add(code);
       }
     });
@@ -643,7 +803,15 @@
     const props = feature?.properties || {};
     const { codes } = resolveFeatureCodes(props, codeMeta);
     const code = codes && codes.size ? codes.values().next().value : '';
-    const areaHa = def.type === 'polygon' ? computeAreaHa(feature) : 0;
+    let areaHa = 0;
+    if (def.type === 'polygon') {
+      const fromProps = extractFeatureArea(props);
+      if (Number.isFinite(fromProps) && fromProps > 0) {
+        areaHa = fromProps;
+      } else {
+        areaHa = computeAreaHa(feature);
+      }
+    }
     let lengthKm = 0;
     if (def.lengthProperty) {
       const rawLen = props[def.lengthProperty];
@@ -695,6 +863,41 @@
       if (selectedCodes.has(codes)) return true;
     }
     return !!code && selectedCodes.has(code);
+  }
+
+  function gatherItemCodes(item, target) {
+    if (!item || !target) return;
+    const addValue = value => {
+      if (!value) return;
+      const normalised = normaliseCode(value);
+      target.add(normalised || value);
+    };
+    const { codes, code } = item;
+    if (codes instanceof Set) {
+      codes.forEach(addValue);
+    } else if (Array.isArray(codes)) {
+      codes.forEach(addValue);
+    } else if (typeof codes === 'string' && codes) {
+      addValue(codes);
+    }
+    if (code) {
+      addValue(code);
+    }
+  }
+
+  function collectMissingCodes(state, selectedCodes) {
+    if (!state || !(selectedCodes instanceof Set) || selectedCodes.size === 0) {
+      return [];
+    }
+    const present = new Set();
+    (state.filtered || []).forEach(item => gatherItemCodes(item, present));
+    const missing = [];
+    selectedCodes.forEach(code => {
+      if (!present.has(code)) {
+        missing.push(code);
+      }
+    });
+    return missing.sort((a, b) => String(a).localeCompare(String(b), 'pt-BR'));
   }
 
   function createPopupContent(feature) {
@@ -1213,6 +1416,7 @@
   const microUi = setupMicroFilterControl();
   let microOptions = [];
   const allMicroCodes = new Set();
+  let microTotalArea = 0;
   let activeCodes = new Set();
   let microOptionsReady = false;
   let selectedRegion = '';
@@ -1297,6 +1501,18 @@
     updateLegendDock();
   });
 
+  const microState = stateByKey.get('microbacias');
+  if (microState) {
+    map.addLayer(microState.group);
+    loadLayer(microState)
+      .then(() => {
+        applyFilters();
+      })
+      .catch(error => {
+        console.error('Falha ao carregar a camada de microbacias.', error);
+      });
+  }
+
   if (microUi.search) {
     microUi.search.addEventListener('input', () => {
       renderMicroList();
@@ -1355,5 +1571,901 @@
     return activeCodes;
   }
 
+  function getSelectedMicroArea(selectedCodes) {
+    if (!microIndexReady) return 0;
+    if (selectedCodes === null) {
+      return microTotalArea;
+    }
+    if (!(selectedCodes instanceof Set) || selectedCodes.size === 0) {
+      return 0;
+    }
+    let total = 0;
+    selectedCodes.forEach(code => {
+      const entry = microIndex.byCode.get(code);
+      if (!entry) return;
+      const area = Number(entry.areaHa);
+      if (Number.isFinite(area) && area > 0) {
+        total += area;
+      }
+    });
+    return total;
+  }
+
+  function fitMapToSelection(selectedCodes) {
+    if (!microIndexReady) return;
+    let bounds = null;
+    const extend = entry => {
+      if (!entry || !entry.bounds) return;
+      const entryBounds = entry.bounds;
+      if (!entryBounds || !entryBounds.isValid || !entryBounds.isValid()) return;
+      bounds = bounds
+        ? bounds.extend(entryBounds)
+        : L.latLngBounds(entryBounds.getSouthWest(), entryBounds.getNorthEast());
+    };
+    if (selectedCodes === null) {
+      if (microIndex.fullBounds && microIndex.fullBounds.isValid && microIndex.fullBounds.isValid()) {
+        bounds = L.latLngBounds(
+          microIndex.fullBounds.getSouthWest(),
+          microIndex.fullBounds.getNorthEast()
+        );
+      } else {
+        microIndex.byCode.forEach(entry => extend(entry));
+      }
+    } else if (selectedCodes instanceof Set && selectedCodes.size) {
+      selectedCodes.forEach(code => {
+        const entry = microIndex.byCode.get(code);
+        if (entry) {
+          extend(entry);
+        }
+      });
+    }
+    if (bounds && bounds.isValid && bounds.isValid()) {
+      map.fitBounds(bounds.pad(0.08));
+    }
+  }
+
   function applyFilters(options = {}) {
+    const { fitToMicro = false } = options;
     const effectiveCodes = getEffectiveCodes();
+    stateByKey.forEach(state => {
+      if (!state || !state.ready) return;
+      const { enriched = [], group } = state;
+      const filtered = !effectiveCodes
+        ? [...enriched]
+        : enriched.filter(item => featureMatchesSelection(item, effectiveCodes));
+      state.filtered = filtered;
+      state.displayLayer = null;
+      if (group && typeof group.clearLayers === 'function') {
+        group.clearLayers();
+      }
+      if (!filtered.length) return;
+      const features = filtered.map(item => item.feature).filter(Boolean);
+      if (!features.length) return;
+      const displayLayer = buildGeoJsonLayer(state.def, features);
+      state.displayLayer = displayLayer;
+      if (group) {
+        group.addLayer(displayLayer);
+      }
+      updateLayerOpacity(state);
+    });
+    updateLegendDock(effectiveCodes);
+    updateMicroSummary();
+    if (fitToMicro) {
+      fitMapToSelection(effectiveCodes);
+    }
+  }
+
+  function updateLayerOpacity(state) {
+    if (!state || !state.displayLayer) return;
+    const { def, displayLayer } = state;
+    displayLayer.eachLayer(layer => {
+      const feature = layer?.feature;
+      if (!feature || typeof layer.setStyle !== 'function') return;
+      if (def.type === 'polygon') {
+        layer.setStyle(getPolygonStyle(def, feature));
+      } else if (def.type === 'line') {
+        layer.setStyle(getLineStyle(def, feature));
+      } else if (def.type === 'point') {
+        layer.setStyle(getPointStyle(def, feature));
+      }
+    });
+  }
+
+  function updateLegendDock(effectiveCodes) {
+    if (!legendContainer) return;
+    legendContainer.innerHTML = '';
+
+    const selectionCodes = effectiveCodes === null
+      ? (activeCodes instanceof Set && activeCodes.size ? activeCodes : null)
+      : effectiveCodes;
+
+    const activeStates = [];
+    stateByKey.forEach(state => {
+      if (!state || !state.ready) return;
+      if (!map.hasLayer(state.group)) return;
+      if (!state.filtered) return;
+      activeStates.push({ state, hasData: state.filtered.length > 0 });
+    });
+
+    if (!activeStates.length) {
+      const empty = document.createElement('div');
+      empty.className = 'legend-empty';
+      empty.textContent = 'Ative uma camada temática para ver a legenda.';
+      legendContainer.appendChild(empty);
+      return;
+    }
+
+    if (microIndexReady) {
+      const summary = document.createElement('div');
+      summary.className = 'legend-note';
+      if (!activeCodes || activeCodes.size === 0) {
+        summary.textContent = 'Nenhuma microbacia selecionada.';
+      } else if (activeCodes.size >= microOptions.length) {
+        summary.textContent = `Todas as ${fmt.count(microOptions.length)} microbacias (${fmt.ha(microTotalArea)} ha)`;
+      } else {
+        const selectedArea = getSelectedMicroArea(effectiveCodes || activeCodes);
+        summary.textContent = `${fmt.count(activeCodes.size)} selecionada(s) • ${fmt.ha(selectedArea)} ha`;
+      }
+      legendContainer.appendChild(summary);
+    }
+
+    activeStates.forEach(({ state, hasData }) => {
+      const block = document.createElement('div');
+      block.className = 'legend-block';
+      const header = document.createElement('h4');
+      header.textContent = state.def.name;
+      block.appendChild(header);
+
+      const legend = state.def.legend || {};
+      const type = legend.type || 'area-total';
+
+      if (hasData) {
+        if (type === 'area-classes') {
+          block.appendChild(renderAreaClassesLegend(state, legend, effectiveCodes));
+        } else if (type === 'length-total') {
+          block.appendChild(renderLengthLegend(state, legend));
+        } else if (type === 'count-total') {
+          block.appendChild(renderCountLegend(state, legend));
+        } else {
+          block.appendChild(renderAreaTotalLegend(state, legend, effectiveCodes));
+        }
+      } else {
+        const note = document.createElement('div');
+        note.className = 'legend-note';
+        let message = 'Nenhuma feição atende à seleção atual.';
+        if (selectionCodes instanceof Set && selectionCodes.size) {
+          const missing = collectMissingCodes(state, selectionCodes);
+          if (missing.length) {
+            const preview = missing.slice(0, 4).map(code => `OTTO ${code}`).join(', ');
+            const remaining = missing.length - Math.min(missing.length, 4);
+            message = remaining > 0
+              ? `Sem registros para ${preview} e mais ${remaining} microbacia(s).`
+              : `Sem registros para ${preview}.`;
+          }
+        }
+        note.textContent = message;
+        block.appendChild(note);
+      }
+
+      if (legend.note) {
+        const note = document.createElement('div');
+        note.className = 'legend-note';
+        note.textContent = legend.note;
+        block.appendChild(note);
+      }
+
+      if (hasData && selectionCodes instanceof Set && selectionCodes.size) {
+        const missing = collectMissingCodes(state, selectionCodes);
+        if (missing.length) {
+          const note = document.createElement('div');
+          note.className = 'legend-note';
+          const preview = missing.slice(0, 4).map(code => `OTTO ${code}`).join(', ');
+          const remaining = missing.length - Math.min(missing.length, 4);
+          note.textContent = remaining > 0
+            ? `Sem registros para ${preview} e mais ${remaining} microbacia(s).`
+            : `Sem registros para ${preview}.`;
+          block.appendChild(note);
+        }
+      }
+
+      legendContainer.appendChild(block);
+    });
+  }
+
+  function createCoverageNote(totalAreaHa, effectiveCodes, state) {
+    if (!microIndexReady) return null;
+    const baseArea = getSelectedMicroArea(effectiveCodes || activeCodes);
+    if (!Number.isFinite(baseArea) || baseArea <= 0) return null;
+    if (!Number.isFinite(totalAreaHa)) return null;
+    const diff = totalAreaHa - baseArea;
+    const diffAbs = Math.abs(diff);
+    const coverage = Math.max(0, Math.min(9999, (totalAreaHa / baseArea) * 100));
+    const note = document.createElement('div');
+    note.className = 'legend-note';
+    const sign = diffAbs < 0.01 ? '±' : diff >= 0 ? '+' : '−';
+    note.textContent = `Cobertura sobre as microbacias: ${fmt.pct(coverage)}% (Δ ${sign}${fmt.ha(diffAbs)} ha)`;
+    if (diffAbs > 1 || Math.abs(coverage - 100) > 2) {
+      console.warn(
+        `Diferença de área detectada na camada "${state.def.name}": microbacias ${baseArea.toFixed(2)} ha × camada ${totalAreaHa.toFixed(2)} ha.`
+      );
+    }
+    return note;
+  }
+
+  function renderAreaTotalLegend(state, legend, effectiveCodes) {
+    const totalArea = state.filtered.reduce((sum, item) => {
+      const area = Number(item.areaHa);
+      return Number.isFinite(area) && area > 0 ? sum + area : sum;
+    }, 0);
+    const list = document.createElement('ul');
+    list.className = 'legend-list';
+    const li = document.createElement('li');
+    li.className = 'legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'legend-swatch';
+    swatch.style.background = legend.color || '#1f2937';
+    li.appendChild(swatch);
+
+    const label = document.createElement('span');
+    label.className = 'legend-label';
+    label.textContent = legend.title || 'Área total';
+    li.appendChild(label);
+
+    const value = document.createElement('span');
+    value.className = 'legend-value';
+    let text = `${fmt.ha(totalArea)} ha`;
+    if (legend.includeCount) {
+      text += ` · ${fmt.count(state.filtered.length)} feições`;
+    }
+    value.textContent = text;
+    li.appendChild(value);
+    list.appendChild(li);
+
+    const wrapper = document.createElement('div');
+    wrapper.appendChild(list);
+    const coverage = createCoverageNote(totalArea, effectiveCodes, state);
+    if (coverage) {
+      wrapper.appendChild(coverage);
+    }
+    return wrapper;
+  }
+
+  function renderAreaClassesLegend(state, legend, effectiveCodes) {
+    const groups = new Map();
+    let totalArea = 0;
+    state.filtered.forEach(item => {
+      const area = Number(item.areaHa);
+      if (Number.isFinite(area) && area > 0) {
+        totalArea += area;
+      }
+      const keyRaw = trim(item.classValue);
+      const key = keyRaw || '__sem_classe__';
+      if (!groups.has(key)) {
+        groups.set(key, { value: keyRaw, areaHa: 0, feature: item.feature });
+      }
+      const entry = groups.get(key);
+      if (Number.isFinite(area) && area > 0) {
+        entry.areaHa += area;
+      }
+      if (!entry.feature && item.feature) {
+        entry.feature = item.feature;
+      }
+    });
+
+    const entries = Array.from(groups.values());
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'legend-empty';
+      empty.textContent = 'Sem dados para a seleção atual.';
+      return empty;
+    }
+
+    if (Array.isArray(legend.order) && legend.order.length) {
+      const orderMap = new Map();
+      legend.order.forEach((value, idx) => {
+        orderMap.set(normaliseText(value), idx);
+      });
+      entries.sort((a, b) => {
+        const aKey = normaliseText(a.value);
+        const bKey = normaliseText(b.value);
+        const aIdx = orderMap.has(aKey) ? orderMap.get(aKey) : Number.POSITIVE_INFINITY;
+        const bIdx = orderMap.has(bKey) ? orderMap.get(bKey) : Number.POSITIVE_INFINITY;
+        if (aIdx === bIdx) {
+          return aKey.localeCompare(bKey, 'pt-BR');
+        }
+        return aIdx - bIdx;
+      });
+    } else if (typeof legend.sorter === 'function') {
+      entries.sort((a, b) => {
+        try {
+          return legend.sorter(a, b);
+        } catch (error) {
+          return 0;
+        }
+      });
+    } else {
+      entries.sort((a, b) => b.areaHa - a.areaHa);
+    }
+
+    const list = document.createElement('ul');
+    list.className = 'legend-list';
+
+    entries.forEach(entry => {
+      const li = document.createElement('li');
+      li.className = 'legend-item';
+      const swatch = document.createElement('span');
+      swatch.className = 'legend-swatch';
+      let color = '#1f2937';
+      try {
+        if (typeof legend.getColor === 'function') {
+          color = legend.getColor(entry.value, entry.feature);
+        } else {
+          color = legendColorFor(state.def, entry.feature);
+        }
+      } catch (error) {
+        color = '#1f2937';
+      }
+      swatch.style.background = color;
+      li.appendChild(swatch);
+
+      const label = document.createElement('span');
+      label.className = 'legend-label';
+      let text = entry.value || 'Sem classificação';
+      if (typeof legend.labelFor === 'function') {
+        try {
+          text = legend.labelFor(entry.value, entry);
+        } catch (error) {
+          text = entry.value || 'Sem classificação';
+        }
+      }
+      label.textContent = text;
+      li.appendChild(label);
+
+      const value = document.createElement('span');
+      value.className = 'legend-value';
+      value.textContent = `${fmt.ha(entry.areaHa)} ha`;
+      li.appendChild(value);
+
+      list.appendChild(li);
+    });
+
+    const wrapper = document.createElement('div');
+    wrapper.appendChild(list);
+    const coverage = createCoverageNote(totalArea, effectiveCodes, state);
+    if (coverage) {
+      wrapper.appendChild(coverage);
+    }
+    return wrapper;
+  }
+
+  function renderLengthLegend(state, legend) {
+    const totalLength = state.filtered.reduce((sum, item) => {
+      const length = Number(item.lengthKm);
+      return Number.isFinite(length) && length > 0 ? sum + length : sum;
+    }, 0);
+    const list = document.createElement('ul');
+    list.className = 'legend-list';
+    const li = document.createElement('li');
+    li.className = 'legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'legend-swatch line';
+    swatch.style.background = legend.color || '#1f2937';
+    li.appendChild(swatch);
+    const label = document.createElement('span');
+    label.className = 'legend-label';
+    label.textContent = legend.title || 'Extensão total';
+    li.appendChild(label);
+    const value = document.createElement('span');
+    value.className = 'legend-value';
+    value.textContent = `${fmt.km(totalLength)} ${legend.unit || 'km'}`;
+    li.appendChild(value);
+    list.appendChild(li);
+    return list;
+  }
+
+  function renderCountLegend(state, legend) {
+    const totalCount = state.filtered.reduce((sum, item) => {
+      const count = Number(item.pointCount);
+      if (Number.isFinite(count) && count > 0) {
+        return sum + count;
+      }
+      return sum + 1;
+    }, 0);
+    const list = document.createElement('ul');
+    list.className = 'legend-list';
+    const li = document.createElement('li');
+    li.className = 'legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'legend-swatch';
+    swatch.style.background = legend.color || '#1f2937';
+    li.appendChild(swatch);
+    const label = document.createElement('span');
+    label.className = 'legend-label';
+    label.textContent = legend.title || 'Total de registros';
+    li.appendChild(label);
+    const value = document.createElement('span');
+    value.className = 'legend-value';
+    value.textContent = `${fmt.count(totalCount)} ${legend.unit || 'registros'}`;
+    li.appendChild(value);
+    list.appendChild(li);
+    return list;
+  }
+
+  function loadLayer(state) {
+    if (!state) return Promise.resolve();
+    if (state.ready && !state.loading) {
+      return Promise.resolve(state);
+    }
+    if (state.loading && state.promise) {
+      return state.promise;
+    }
+    state.loading = true;
+    state.promise = (async () => {
+      const { def } = state;
+      const features = [];
+      for (const file of def.files) {
+        try {
+          const part = await fetchGeoJsonFile(file);
+          if (Array.isArray(part)) {
+            part.forEach(feature => {
+              if (feature) {
+                features.push(feature);
+              }
+            });
+          }
+        } catch (error) {
+          console.error(`Falha ao carregar o arquivo ${file}`, error);
+        }
+      }
+      state.features = features;
+      state.codeMeta = buildLayerCodeMetadata(def, features);
+      state.enriched = features.map(feature => enrichFeature(def, feature, state.codeMeta));
+      state.ready = true;
+      state.loading = false;
+      if (def.key === 'microbacias') {
+        prepareMicroOptions(state);
+      }
+      return state;
+    })().catch(error => {
+      state.loading = false;
+      throw error;
+    });
+    return state.promise;
+  }
+
+  function prepareMicroOptions(state) {
+    microIndex.byCode.clear();
+    microIndex.manancialCodeToOtto.clear();
+    microIndex.manancialNameToOtto.clear();
+    microIndex.fullBounds = null;
+
+    const unique = new Map();
+    let combinedBounds = null;
+    microTotalArea = 0;
+
+    (state.enriched || []).forEach(item => {
+      const code = normaliseCode(item.code || (item.codes instanceof Set ? Array.from(item.codes)[0] : item.codes));
+      if (!code || unique.has(code)) return;
+      const feature = item.feature;
+      const props = feature?.properties || {};
+      const name = resolveFieldValue(props, MICRO_NAME_FIELDS) || `Microbacia ${code}`;
+      const region = resolveFieldValue(props, MICRO_REGION_FIELDS, MICRO_REGION_PATTERNS);
+      const municipio = resolveFieldValue(props, MICRO_MUNICIPIO_FIELDS, MICRO_MUNICIPIO_PATTERNS);
+      const manancial = resolveFieldValue(props, MICRO_MANANCIAL_FIELDS, MICRO_MANANCIAL_PATTERNS);
+      const areaHa = Number(item.areaHa);
+      if (Number.isFinite(areaHa) && areaHa > 0) {
+        microTotalArea += areaHa;
+      }
+
+      let bounds = null;
+      try {
+        const temp = L.geoJSON(feature);
+        bounds = temp.getBounds?.() || null;
+        temp.remove?.();
+      } catch (error) {
+        bounds = null;
+      }
+      if (bounds && bounds.isValid && bounds.isValid()) {
+        const clone = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
+        bounds = clone;
+        if (!combinedBounds) {
+          combinedBounds = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
+        } else {
+          combinedBounds.extend(bounds);
+        }
+      } else {
+        bounds = null;
+      }
+
+      const searchText = [code, name, region, municipio, manancial]
+        .map(value => normaliseText(value))
+        .filter(Boolean)
+        .join(' ');
+
+      const entry = {
+        code,
+        name,
+        region: region || '',
+        municipio: municipio || '',
+        manancial: manancial || '',
+        areaHa: Number.isFinite(areaHa) ? areaHa : 0,
+        feature,
+        bounds,
+        searchText
+      };
+      unique.set(code, entry);
+
+      microIndex.byCode.set(code, {
+        code,
+        name,
+        region: entry.region,
+        municipio: entry.municipio,
+        manancial: entry.manancial,
+        areaHa: entry.areaHa,
+        feature,
+        bounds
+      });
+
+      const manCodes = gatherValues(props, MICRO_MANANCIAL_CODE_FIELDS, MICRO_MANANCIAL_CODE_PATTERNS, { numericOnly: true });
+      manCodes.forEach(value => {
+        const normalised = normaliseCode(value);
+        if (!normalised) return;
+        ensureSet(microIndex.manancialCodeToOtto, normalised).add(code);
+      });
+
+      const manNames = gatherValues(props, MICRO_MANANCIAL_FIELDS, MICRO_MANANCIAL_PATTERNS);
+      manNames.forEach(value => {
+        const normalised = normaliseText(value);
+        if (!normalised) return;
+        ensureSet(microIndex.manancialNameToOtto, normalised).add(code);
+      });
+    });
+
+    microOptions = Array.from(unique.values()).sort((a, b) => {
+      if (a.region && b.region && a.region !== b.region) {
+        return a.region.localeCompare(b.region, 'pt-BR');
+      }
+      if (a.municipio && b.municipio && a.municipio !== b.municipio) {
+        return a.municipio.localeCompare(b.municipio, 'pt-BR');
+      }
+      return a.name.localeCompare(b.name, 'pt-BR');
+    });
+
+    allMicroCodes.clear();
+    microOptions.forEach(option => allMicroCodes.add(option.code));
+    microIndex.fullBounds = combinedBounds || null;
+    microOptionsReady = true;
+    microIndexReady = true;
+
+    if (microUi.filters) {
+      Object.values(microUi.filters).forEach(select => {
+        if (select) {
+          select.disabled = false;
+        }
+      });
+    }
+
+    updateFilterSelects();
+    renderMicroList();
+    updateMicroSummary();
+    refreshLayersAfterMicroIndex();
+    applyFilters();
+  }
+
+  function refreshLayersAfterMicroIndex() {
+    if (!microIndexReady) return;
+    stateByKey.forEach(state => {
+      if (!state || !state.ready) return;
+      if (!Array.isArray(state.features) || !state.features.length) return;
+      state.enriched = state.features.map(feature => enrichFeature(state.def, feature, state.codeMeta));
+    });
+  }
+
+  function updateFilterSelects() {
+    if (!microOptionsReady) return;
+    const filters = microUi.filters || {};
+    const regionSelect = filters.region;
+    const municipioSelect = filters.municipio;
+    const manancialSelect = filters.manancial;
+
+    const regionValues = new Set();
+    const municipioValues = new Set();
+    const manancialValues = new Set();
+
+    microOptions.forEach(option => {
+      if (!option) return;
+      if (!selectedMunicipio || option.municipio === selectedMunicipio) {
+        if (!selectedManancial || option.manancial === selectedManancial) {
+          if (option.region) {
+            regionValues.add(option.region);
+          }
+        }
+      }
+      if (!selectedRegion || option.region === selectedRegion) {
+        if (!selectedManancial || option.manancial === selectedManancial) {
+          if (option.municipio) {
+            municipioValues.add(option.municipio);
+          }
+        }
+      }
+      if (!selectedRegion || option.region === selectedRegion) {
+        if (!selectedMunicipio || option.municipio === selectedMunicipio) {
+          if (option.manancial) {
+            manancialValues.add(option.manancial);
+          }
+        }
+      }
+    });
+
+    if (regionSelect) {
+      populateSelectOptions(regionSelect, regionValues, 'Todas as regionais', selectedRegion);
+      if (selectedRegion && !regionValues.has(selectedRegion)) {
+        selectedRegion = '';
+        regionSelect.value = '';
+      }
+    }
+    if (municipioSelect) {
+      populateSelectOptions(municipioSelect, municipioValues, 'Todos os municípios', selectedMunicipio);
+      if (selectedMunicipio && !municipioValues.has(selectedMunicipio)) {
+        selectedMunicipio = '';
+        municipioSelect.value = '';
+      }
+    }
+    if (manancialSelect) {
+      populateSelectOptions(manancialSelect, manancialValues, 'Todos os mananciais', selectedManancial);
+      if (selectedManancial && !manancialValues.has(selectedManancial)) {
+        selectedManancial = '';
+        manancialSelect.value = '';
+      }
+    }
+  }
+
+  function populateSelectOptions(select, values, placeholder, selectedValue) {
+    if (!select) return;
+    const sorted = Array.from(values).filter(Boolean).sort((a, b) => a.localeCompare(b, 'pt-BR'));
+    select.innerHTML = '';
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = placeholder;
+    select.appendChild(defaultOption);
+    sorted.forEach(value => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      select.appendChild(option);
+    });
+    if (selectedValue && values.has(selectedValue)) {
+      select.value = selectedValue;
+    } else {
+      select.value = '';
+    }
+  }
+
+  function renderMicroList() {
+    if (!microUi.list) return;
+    microUi.list.innerHTML = '';
+
+    if (!microOptionsReady || !microOptions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'micro-empty';
+      empty.textContent = 'Carregando microbacias...';
+      microUi.list.appendChild(empty);
+      lastRenderedCodes = [];
+      return;
+    }
+
+    const searchValue = microUi.search ? normaliseText(microUi.search.value) : '';
+    const searchWords = searchValue ? searchValue.split(/\s+/).filter(Boolean) : [];
+
+    const filtered = microOptions.filter(option => {
+      if (selectedRegion && option.region !== selectedRegion) return false;
+      if (selectedMunicipio && option.municipio !== selectedMunicipio) return false;
+      if (selectedManancial && option.manancial !== selectedManancial) return false;
+      if (!searchWords.length) return true;
+      return searchWords.every(word => option.searchText.includes(word));
+    });
+
+    lastRenderedCodes = filtered.map(option => option.code);
+
+    if (!filtered.length) {
+      const empty = document.createElement('div');
+      empty.className = 'micro-empty';
+      empty.textContent = 'Nenhuma microbacia atende aos filtros.';
+      microUi.list.appendChild(empty);
+      return;
+    }
+
+    filtered.forEach(option => {
+      const label = document.createElement('label');
+      label.className = 'micro-option';
+      if (activeCodes.has(option.code)) {
+        label.classList.add('active');
+      }
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = activeCodes.has(option.code);
+      checkbox.addEventListener('change', event => {
+        if (event.target.checked) {
+          activeCodes.add(option.code);
+          label.classList.add('active');
+        } else {
+          activeCodes.delete(option.code);
+          label.classList.remove('active');
+        }
+        updateMicroSummary();
+        applyFilters({ fitToMicro: true });
+      });
+      label.appendChild(checkbox);
+
+      const text = document.createElement('div');
+      text.className = 'micro-option-text';
+
+      const title = document.createElement('div');
+      title.className = 'micro-option-title';
+      title.textContent = option.name;
+      text.appendChild(title);
+
+      const metaLine = document.createElement('div');
+      metaLine.className = 'micro-option-sub';
+      const pieces = [];
+      if (option.region) pieces.push(option.region);
+      if (option.municipio) pieces.push(option.municipio);
+      metaLine.textContent = pieces.length ? pieces.join(' • ') : '—';
+      text.appendChild(metaLine);
+
+      const infoLine = document.createElement('div');
+      infoLine.className = 'micro-option-sub';
+      const infoPieces = [`OTTO ${option.code}`];
+      if (option.manancial) {
+        infoPieces.push(`Manancial: ${option.manancial}`);
+      }
+      infoLine.textContent = infoPieces.join(' • ');
+      text.appendChild(infoLine);
+
+      const areaLine = document.createElement('div');
+      areaLine.className = 'micro-option-area';
+      areaLine.textContent = `Área: ${fmt.ha(option.areaHa)} ha`;
+      text.appendChild(areaLine);
+
+      label.appendChild(text);
+      microUi.list.appendChild(label);
+    });
+  }
+
+  function updateMicroSummary() {
+    if (!microUi.summary) return;
+    if (!microOptionsReady || !microOptions.length) {
+      microUi.summary.textContent = 'Carregando microbacias...';
+      return;
+    }
+    if (!activeCodes || activeCodes.size === 0) {
+      microUi.summary.textContent = 'Nenhuma microbacia selecionada.';
+      return;
+    }
+    if (activeCodes.size >= microOptions.length) {
+      microUi.summary.textContent = `Todas as ${fmt.count(microOptions.length)} microbacias (${fmt.ha(microTotalArea)} ha)`;
+      return;
+    }
+    let area = 0;
+    activeCodes.forEach(code => {
+      const entry = microIndex.byCode.get(code);
+      if (!entry) return;
+      const value = Number(entry.areaHa);
+      if (Number.isFinite(value) && value > 0) {
+        area += value;
+      }
+    });
+    microUi.summary.textContent = `${fmt.count(activeCodes.size)} selecionada(s) • ${fmt.ha(area)} ha`;
+  }
+
+  function setupMicroFilterControl() {
+    const ui = {
+      container: null,
+      summary: null,
+      search: null,
+      list: null,
+      selectAll: null,
+      clear: null,
+      filters: {}
+    };
+
+    const Control = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd() {
+        const container = L.DomUtil.create('div', 'leaflet-control micro-filter');
+        ui.container = container;
+        L.DomEvent.disableClickPropagation(container);
+        L.DomEvent.disableScrollPropagation(container);
+
+        const header = document.createElement('div');
+        header.className = 'micro-header';
+
+        const titleWrap = document.createElement('div');
+        const title = document.createElement('h2');
+        title.textContent = 'Microbacias';
+        titleWrap.appendChild(title);
+        const summary = document.createElement('p');
+        summary.className = 'micro-summary';
+        summary.textContent = 'Carregando microbacias...';
+        ui.summary = summary;
+        titleWrap.appendChild(summary);
+
+        const actions = document.createElement('div');
+        actions.className = 'micro-actions';
+        const selectAllBtn = document.createElement('button');
+        selectAllBtn.type = 'button';
+        selectAllBtn.className = 'btn-chip';
+        selectAllBtn.textContent = 'Selecionar exibidos';
+        ui.selectAll = selectAllBtn;
+        const clearBtn = document.createElement('button');
+        clearBtn.type = 'button';
+        clearBtn.className = 'btn-chip';
+        clearBtn.textContent = 'Limpar seleção';
+        ui.clear = clearBtn;
+        actions.appendChild(selectAllBtn);
+        actions.appendChild(clearBtn);
+
+        header.appendChild(titleWrap);
+        header.appendChild(actions);
+        container.appendChild(header);
+
+        const search = document.createElement('input');
+        search.type = 'search';
+        search.className = 'micro-search';
+        search.placeholder = 'Buscar por nome, município ou código...';
+        ui.search = search;
+        container.appendChild(search);
+
+        const filters = document.createElement('div');
+        filters.className = 'micro-filters';
+
+        const createField = (labelText, placeholder) => {
+          const wrapper = document.createElement('label');
+          wrapper.className = 'micro-filter-field';
+          const label = document.createElement('span');
+          label.className = 'micro-filter-label';
+          label.textContent = labelText;
+          const select = document.createElement('select');
+          select.className = 'micro-select';
+          select.disabled = true;
+          const option = document.createElement('option');
+          option.value = '';
+          option.textContent = placeholder;
+          select.appendChild(option);
+          wrapper.appendChild(label);
+          wrapper.appendChild(select);
+          filters.appendChild(wrapper);
+          return select;
+        };
+
+        const regionSelect = createField('Regional', 'Todas as regionais');
+        const municipioSelect = createField('Município', 'Todos os municípios');
+        const manancialSelect = createField('Manancial', 'Todos os mananciais');
+        ui.filters = {
+          region: regionSelect,
+          municipio: municipioSelect,
+          manancial: manancialSelect
+        };
+
+        container.appendChild(filters);
+
+        const list = document.createElement('div');
+        list.className = 'micro-list';
+        const placeholder = document.createElement('div');
+        placeholder.className = 'micro-empty';
+        placeholder.textContent = 'Carregando microbacias...';
+        list.appendChild(placeholder);
+        ui.list = list;
+        container.appendChild(list);
+
+        return container;
+      }
+    });
+
+    const control = new Control();
+    map.addControl(control);
+    return ui;
+  }
+
+})();
